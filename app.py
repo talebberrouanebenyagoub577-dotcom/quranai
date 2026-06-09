@@ -629,8 +629,9 @@ def analyze_amazon_product(url):
         product = extract_product_data(url)
         logger.info("Extraction success | title: %s", product.get("title", ""))
     except ProductExtractionError as exc:
-        logger.error("Extraction failure for %s | reason: %s", url, exc)
-        return EXTRACTION_FAIL_MESSAGE
+        reason = str(exc).strip() or EXTRACTION_FAIL_MESSAGE
+        logger.error("Extraction failure for %s | reason: %s", url, reason)
+        return reason
 
     cached = PRODUCT_MEMORY.get(url=product.get("url"), asin=product.get("asin"))
     if is_cache_valid(cached):
@@ -707,7 +708,28 @@ def analyze_amazon_product(url):
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok"})
+    checks = {
+        "quran_memory": os.path.exists(config.MEMORY_FILE),
+        "brain_memory": os.path.exists(config.BRAIN_MEMORY_FILE),
+        "product_memory": os.path.exists(config.PRODUCT_MEMORY_FILE),
+        "conversations": os.path.exists(config.CONVERSATIONS_FILE),
+        "logs_writable": os.access(config.LOG_DIR, os.W_OK),
+        "backups_writable": os.access(config.BACKUP_DIR, os.W_OK),
+    }
+
+    try:
+        response = requests.get(f"{OLLAMA_BASE}/api/tags", timeout=5)
+        checks["ollama"] = response.status_code == 200
+    except requests.RequestException:
+        checks["ollama"] = False
+
+    return jsonify({
+        "status": "ok",
+        "env": config.ENV,
+        "host": APP_HOST,
+        "port": APP_PORT,
+        "checks": checks,
+    })
 
 
 @app.route("/", methods=["GET"])
@@ -880,9 +902,10 @@ def api_analyze_product():
     try:
         answer = analyze_amazon_product(amazon_url)
         return jsonify({"answer": answer, "mode": "product", "amazon_url": amazon_url})
-    except ProductExtractionError:
-        logger.error("API /api/analyze-product extraction failure | URL: %s", amazon_url)
-        return jsonify({"answer": EXTRACTION_FAIL_MESSAGE, "mode": "product"}), 200
+    except ProductExtractionError as exc:
+        reason = str(exc).strip() or EXTRACTION_FAIL_MESSAGE
+        logger.error("API /api/analyze-product extraction failure | URL: %s | reason: %s", amazon_url, reason)
+        return jsonify({"answer": reason, "mode": "product"}), 200
     except requests.RequestException as exc:
         return jsonify({"error": f"خطأ في تحليل المنتج: {exc}"}), 500
 

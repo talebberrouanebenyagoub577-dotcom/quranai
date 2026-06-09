@@ -1,15 +1,15 @@
 [Unit]
 Description=Sahra AI — Quran-based commerce assistant
-After=network.target
+After=network.target ollama.service
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=www-data
-Group=www-data
-WorkingDirectory=/opt/sahra
-EnvironmentFile=/opt/sahra/.env
-ExecStart=/bin/bash /opt/sahra/start.sh
+User=root
+Group=root
+WorkingDirectory=/opt/quranai
+EnvironmentFile=-/opt/quranai/.env
+ExecStart=/bin/bash /opt/quranai/start.sh
 ExecReload=/bin/kill -s HUP $MAINPID
 Restart=always
 RestartSec=5

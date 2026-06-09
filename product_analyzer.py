@@ -4,6 +4,7 @@ Read-only: no orders, no login, no new laws.
 """
 
 import json
+import logging
 import os
 import re
 import time
@@ -11,6 +12,8 @@ from html import unescape
 from urllib.parse import urlparse
 
 import requests
+
+logger = logging.getLogger("sahra.amazon")
 
 PRODUCT_MEMORY_FILE = "product_memory.json"
 MEMORY_VERSION = 2
@@ -36,15 +39,121 @@ ASIN_PATTERN = re.compile(
 
 EXTRACTION_FAIL_MESSAGE = "تعذر استخراج بيانات المنتج من الرابط."
 
-FETCH_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
-}
+HTML_PREVIEW_LENGTH = 1000
+
+CAPTCHA_MARKERS = (
+    "captcha",
+    "validatecaptcha",
+    "robot check",
+    "enter the characters you see below",
+    "sorry, we just need to make sure you're not a robot",
+    "type the characters you see in this image",
+    "opfcaptcha",
+    "automated access",
+    "bot-detection",
+    "csm-captcha",
+    "api-services-support@amazon.com",
+    "click the button below to continue shopping",
+    "to discuss automated access to amazon data",
+)
+
+TITLE_SELECTORS = (
+    ("productTitle", r'id=["\']productTitle["\'][^>]*>\s*(.*?)\s*</span>'),
+    ("productTitle_h1", r'<h1[^>]+id=["\']productTitle["\'][^>]*>(.*?)</h1>'),
+    ("og:title", r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)'),
+    ("twitter:title", r'<meta[^>]+name=["\']twitter:title["\'][^>]+content=["\']([^"\']+)'),
+    ("meta_title", r'<meta[^>]+name=["\']title["\'][^>]+content=["\']([^"\']+)'),
+    ("title_tag", r"<title[^>]*>(.*?)</title>"),
+    ("json_title", r'"title"\s*:\s*"([^"]+)"'),
+    ("h1_product", r'id=["\']title["\'][^>]*>(.*?)</'),
+    ("asinTitle", r'"asinTitle"\s*:\s*"([^"]+)"'),
+    ("product_title_json", r'"productTitle"\s*:\s*"([^"]+)"'),
+    ("aria_product", r'id=["\']productTitle["\'][^>]*aria-label=["\']([^"\']+)'),
+    ("ebook_title", r'id=["\']ebooksProductTitle["\'][^>]*>\s*(.*?)\s*</'),
+)
+
+PRICE_SELECTORS = (
+    ("price_whole", r'class=["\']a-price-whole["\'][^>]*>([^<]+)'),
+    ("price_fraction", r'class=["\']a-price-fraction["\'][^>]*>([^<]+)'),
+    ("price_amount", r'"priceAmount"\s*:\s*([0-9.,]+)'),
+    ("price_json", r'"price"\s*:\s*"([^"]+)"'),
+    ("display_price", r'"displayPrice"\s*:\s*"([^"]+)"'),
+    ("buying_option_price", r'"buyingOptionPrice"\s*:\s*"([^"]+)"'),
+    ("apex_price", r'id=["\']apex_price["\'][^>]*>.*?class=["\']a-offscreen["\'][^>]*>\s*([^<]+)'),
+    ("core_price", r'id=["\']corePrice_feature_div["\'][^>]*>.*?class=["\']a-offscreen["\'][^>]*>\s*([^<]+)'),
+    ("priceblock", r'id=["\']priceblock_ourprice["\'][^>]*>\s*([^<]+)'),
+    ("offscreen", r'class=["\']a-offscreen["\'][^>]*>\s*([^<]+)\s*</span>'),
+    ("kindle_price", r'id=["\']kindle-price["\'][^>]*>\s*([^<]+)'),
+    ("price_to_pay", r'data-a-color=["\']price["\'][^>]*>\s*([^<]+)<'),
+)
+
+RATING_SELECTORS = (
+    ("icon_alt", r'class=["\']a-icon-alt["\'][^>]*>\s*([0-9.,]+)\s*(?:out of|من|stars)'),
+    ("rating_json", r'"ratingValue"\s*:\s*"?([0-9.,]+)"?'),
+    ("rating_hook", r'data-hook=["\']rating-out-of-text["\'][^>]*>\s*([0-9.,]+)'),
+    ("average_star", r'data-hook=["\']average-star-rating["\'][^>]*>\s*([0-9.,]+)'),
+    ("acr_popover", r'id=["\']acrPopover["\'][^>]*title=["\']([^"\']+)'),
+    ("average_rating", r'"averageRating"\s*:\s*"?([0-9.,]+)"?'),
+    ("review_stars", r'"reviewStars"\s*:\s*"?([0-9.,]+)"?'),
+    ("star_alt", r'class=["\']a-star-\d[^"\']*["\'][^>]*aria-label=["\']([^"\']+)'),
+)
+
+REVIEW_COUNT_SELECTORS = (
+    ("acr_reviews", r'id=["\']acrCustomerReviewText["\'][^>]*>\s*([^<]+)'),
+    ("total_review_count", r'data-hook=["\']total-review-count["\'][^>]*>\s*([^<]+)'),
+    ("review_count_json", r'"reviewCount"\s*:\s*"?([^",]+)"?'),
+    ("rating_count_json", r'"ratingCount"\s*:\s*"?([^",]+)"?'),
+    ("ratings_text", r'class=["\']a-size-base["\'][^>]*>\s*([0-9,.\s]+)\s*(?:ratings|تقييم|reviews)'),
+    ("reviews_count", r'"reviewsCount"\s*:\s*"?([^",]+)"?'),
+    ("acr_link", r'id=["\']acrCustomerReviewLink["\'][^>]*>\s*([^<]+)'),
+)
+
+def _build_browser_headers(profile="desktop", referer=None):
+    if profile == "mobile":
+        return {
+            "User-Agent": (
+                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) "
+                "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 "
+                "Mobile/15E148 Safari/604.1"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Referer": referer or "https://www.amazon.com/",
+        }
+
+    return {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,"
+            "image/avif,image/webp,image/apng,*/*;q=0.8"
+        ),
+        "Accept-Language": "en-US,en;q=0.9,ar;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "same-origin" if referer else "none",
+        "Sec-Fetch-User": "?1",
+        "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Cache-Control": "max-age=0",
+        "DNT": "1",
+        "Referer": referer or "https://www.amazon.com/",
+    }
+
+
+DESKTOP_HEADERS = _build_browser_headers("desktop")
+MOBILE_HEADERS = _build_browser_headers("mobile")
+
+FETCH_HEADERS = DESKTOP_HEADERS
 
 RECOMMENDATION_LABELS = {
     "suitable": "مناسب للبيع",
@@ -162,9 +271,225 @@ def _normalize_url_text(text):
     if not text:
         return ""
     text = str(text).strip()
-    text = re.sub(r"[\u200e\u200f\u202a-\u202e]", "", text)
+    text = re.sub(r"[\u200e\u200f\u202a-\u202e\u2066-\u2069\ufeff]", "", text)
     text = text.replace("\u00a0", " ")
     return text
+
+
+def _amazon_fetch_urls(url):
+    asin = extract_asin(url)
+    base = (url or "").split("#")[0].split("?")[0].rstrip("/")
+    candidates = []
+    if base:
+        candidates.append(base)
+        candidates.append(f"{base}?language=en_US")
+    if asin:
+        candidates.append(f"https://www.amazon.com/dp/{asin}")
+        candidates.append(f"https://www.amazon.com/dp/{asin}?language=en_US")
+        candidates.append(f"https://www.amazon.com/gp/aw/d/{asin}")
+    deduped = []
+    seen = set()
+    for item in candidates:
+        if item and item not in seen:
+            seen.add(item)
+            deduped.append(item)
+    return deduped
+
+
+def _page_has_product(html, asin=None):
+    if not html:
+        return False
+    if 'id="productTitle"' in html or "id='productTitle'" in html:
+        return True
+    if '"@type":"Product"' in html or '"@type": "Product"' in html:
+        return True
+    if asin and asin in html and ("add-to-cart" in html.lower() or "addToCart" in html):
+        return True
+    return False
+
+
+def _extract_from_asin_json(html, asin):
+    if not asin:
+        return "", "", "", ""
+    title = price = rating = review_count = ""
+    title_match = re.search(
+        rf'"{re.escape(asin)}"[\s\S]{{0,1200}}?"title"\s*:\s*"([^"]+)"',
+        html,
+        re.IGNORECASE,
+    )
+    if title_match:
+        title = _clean_text(title_match.group(1))
+
+    for pattern in (
+        rf'"asin"\s*:\s*"{re.escape(asin)}"[\s\S]{{0,1200}}?"price"\s*:\s*"?([0-9.,]+)"?',
+        r'"priceAmount"\s*:\s*([0-9.,]+)',
+    ):
+        match = re.search(pattern, html, re.IGNORECASE)
+        if match:
+            price = _clean_text(match.group(1))
+            break
+
+    rating_match = re.search(
+        rf'"{re.escape(asin)}"[\s\S]{{0,1200}}?"ratingValue"\s*:\s*"?([0-9.,]+)"?',
+        html,
+        re.IGNORECASE,
+    )
+    if rating_match:
+        rating = _clean_text(rating_match.group(1))
+
+    review_match = re.search(
+        rf'"{re.escape(asin)}"[\s\S]{{0,1200}}?"reviewCount"\s*:\s*"?([^",]+)"?',
+        html,
+        re.IGNORECASE,
+    )
+    if review_match:
+        review_count = _clean_text(review_match.group(1))
+
+    return title, price, rating, review_count
+
+
+def _warm_amazon_session(session):
+    try:
+        session.get(
+            "https://www.amazon.com/",
+            headers=_build_browser_headers("desktop"),
+            timeout=15,
+            allow_redirects=True,
+        )
+        logger.info("Amazon session warmup | homepage=ok")
+    except requests.RequestException as exc:
+        logger.warning("Amazon session warmup failed | error=%s", exc)
+
+
+def _log_redirect_chain(response):
+    if not response.history:
+        return
+    chain = " -> ".join(f"{item.status_code}:{item.url}" for item in response.history)
+    logger.info("Amazon redirect chain | %s -> %s", chain, response.url)
+
+
+def _fetch_html_once(session, url, profile="desktop"):
+    headers = _build_browser_headers(profile, referer="https://www.amazon.com/")
+    response = session.get(url, headers=headers, timeout=25, allow_redirects=True)
+    _log_redirect_chain(response)
+    return response
+
+
+def fetch_product_page(url):
+    logger.info("Amazon fetch start | url=%s", url)
+    asin = extract_asin(url)
+    session = requests.Session()
+    last_response = None
+    last_error = None
+    captcha_hits = 0
+
+    _warm_amazon_session(session)
+
+    for fetch_url in _amazon_fetch_urls(url):
+        for profile_name in ("desktop", "mobile"):
+            try:
+                response = _fetch_html_once(session, fetch_url, profile=profile_name)
+                last_response = response
+            except requests.RequestException as exc:
+                last_error = exc
+                logger.warning(
+                    "Amazon fetch attempt failed | url=%s | profile=%s | error=%s",
+                    fetch_url,
+                    profile_name,
+                    exc,
+                )
+                continue
+
+            status_code = response.status_code
+            final_url = response.url
+            html = response.text or ""
+            page_title = _extract_document_title(html)
+            captcha = _is_captcha_page(html, page_title)
+
+            logger.info(
+                "Amazon fetch attempt | fetch_url=%s | profile=%s | status=%s | "
+                "final_url=%s | html_len=%s | page_title=%s | captcha=%s | has_product=%s",
+                fetch_url,
+                profile_name,
+                status_code,
+                final_url,
+                len(html),
+                page_title or "غير متوفر",
+                captcha,
+                _page_has_product(html, asin),
+            )
+            _log_html_preview(html, final_url, status_code)
+
+            if status_code >= 400:
+                continue
+
+            if captcha:
+                captcha_hits += 1
+                logger.error(
+                    "Amazon CAPTCHA detected | fetch_url=%s | final_url=%s | page_title=%s",
+                    fetch_url,
+                    final_url,
+                    page_title or "غير متوفر",
+                )
+                continue
+
+            if len(html) < 1000:
+                continue
+
+            if _page_has_product(html, asin):
+                return html, final_url, status_code
+
+    if last_error and not last_response:
+        logger.error("Amazon network error | url=%s | error=%s", url, last_error)
+        raise ProductExtractionError(f"تعذر الاتصال بأمازون: {last_error}") from last_error
+
+    if not last_response:
+        raise ProductExtractionError(
+            f"تعذر تحميل صفحة المنتج. ASIN: {asin or 'غير معروف'}. "
+            f"جرّب لاحقاً — أمازون قد يحجب طلبات VPS."
+        )
+
+    status_code = last_response.status_code
+    final_url = last_response.url
+    html = last_response.text or ""
+    page_title = _extract_document_title(html)
+    captcha = _is_captcha_page(html, page_title)
+
+    logger.error(
+        "Amazon fetch exhausted | status=%s | final_url=%s | html_len=%s | "
+        "page_title=%s | captcha=%s | captcha_hits=%s",
+        status_code,
+        final_url,
+        len(html),
+        page_title or "غير متوفر",
+        captcha,
+        captcha_hits,
+    )
+    _log_html_preview(html, final_url, status_code)
+
+    if status_code >= 400:
+        raise ProductExtractionError(
+            f"أمازون أرجعت HTTP {status_code}. الرابط النهائي: {final_url}. "
+            f"عنوان الصفحة: {page_title or 'غير متوفر'}"
+        )
+
+    if len(html) < 1000:
+        raise ProductExtractionError(
+            f"صفحة المنتج قصيرة جداً ({len(html)} حرف). الرابط النهائي: {final_url}. "
+            f"عنوان الصفحة: {page_title or 'غير متوفر'}"
+        )
+
+    if captcha or captcha_hits > 0:
+        raise ProductExtractionError(
+            f"أمازون طلب تحقق CAPTCHA (حجب آلي على VPS). HTTP {status_code}. "
+            f"الرابط النهائي: {final_url}. عنوان الصفحة: {page_title or 'Robot Check'}. "
+            f"ASIN: {asin or 'غير معروف'}"
+        )
+
+    raise ProductExtractionError(
+        f"صفحة أمازون بدون بيانات منتج. HTTP {status_code}. الرابط النهائي: {final_url}. "
+        f"عنوان الصفحة: {page_title or 'غير متوفر'}. ASIN: {asin or 'غير معروف'}"
+    )
 
 
 def _clean_extracted_url(url):
@@ -215,6 +540,73 @@ def _first_match(patterns, html):
     return ""
 
 
+def _first_match_named(selectors, html, sanitize_title=False):
+    for name, pattern in selectors:
+        match = re.search(pattern, html, re.IGNORECASE | re.DOTALL)
+        if match:
+            value = _clean_text(match.group(1))
+            if sanitize_title:
+                value = _sanitize_product_title(value)
+            if value:
+                return value, name
+    return "", ""
+
+
+def _extract_document_title(html):
+    match = re.search(r"<title[^>]*>(.*?)</title>", html or "", re.IGNORECASE | re.DOTALL)
+    return _clean_text(match.group(1)) if match else ""
+
+
+def _is_captcha_page(html, page_title=""):
+    lower_html = (html or "").lower()
+    if any(marker in lower_html for marker in CAPTCHA_MARKERS):
+        return True
+    if page_title and re.search(r"robot|captcha|automated access", page_title, re.IGNORECASE):
+        return True
+    if lower_html and 'id="productTitle"' not in lower_html and "validatecaptcha" in lower_html:
+        return True
+    return False
+
+
+def _log_html_preview(html, final_url, status_code):
+    preview = re.sub(r"\s+", " ", (html or "")[:HTML_PREVIEW_LENGTH])
+    logger.info(
+        "Amazon HTML preview (%s chars) | status=%s | final_url=%s | preview=%s",
+        HTML_PREVIEW_LENGTH,
+        status_code,
+        final_url,
+        preview,
+    )
+
+
+def _sanitize_product_title(text):
+    text = _clean_text(text)
+    if not text:
+        return ""
+    text = re.sub(r"^Amazon\.com\s*:\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*:\s*Amazon\.com.*$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*:\s*Amazon\.[a-z.]+\s*$", "", text, flags=re.IGNORECASE)
+    if text.lower() in ("amazon.com", "amazon.com: online shopping"):
+        return ""
+    return text.strip()
+
+
+def _selector_diagnostics(selectors, html):
+    results = []
+    for name, pattern in selectors:
+        match = re.search(pattern, html or "", re.IGNORECASE | re.DOTALL)
+        results.append(f"{name}:{'hit' if match else 'miss'}")
+    return ", ".join(results)
+
+
+def _combine_price(whole, fraction):
+    whole = (whole or "").strip()
+    fraction = (fraction or "").strip()
+    if whole and fraction:
+        return f"{whole}.{fraction}"
+    return whole or fraction
+
+
 def _parse_json_ld_products(html):
     products = []
     for block in re.findall(
@@ -263,42 +655,13 @@ def _extract_from_json_ld(product):
     return title, price, rating, review_count, category
 
 
-def fetch_product_page(url):
-    try:
-        response = requests.get(url, headers=FETCH_HEADERS, timeout=20, allow_redirects=True)
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        raise ProductExtractionError(
-            "تعذر الوصول إلى صفحة المنتج. تأكد أن الرابط صحيح وأن الصفحة عامة."
-        ) from exc
-
-    if response.status_code >= 400:
-        raise ProductExtractionError("تعذر تحميل صفحة المنتج من أمازون.")
-
-    html = response.text
-    if len(html) < 1000:
-        raise ProductExtractionError("صفحة المنتج فارغة أو محجوبة.")
-
-    blocked_markers = (
-        "captcha",
-        "robot check",
-        "Enter the characters you see below",
-        "sorry, we just need to make sure you're not a robot",
-    )
-    lower_html = html.lower()
-    if any(marker in lower_html for marker in blocked_markers):
-        raise ProductExtractionError(
-            "أمازون حجب الطلب الآلي. جرّب لاحقاً أو انسخ بيانات المنتج يدوياً."
-        )
-
-    return html, response.url
-
-
 def extract_product_data(url):
-    html, final_url = fetch_product_page(url)
+    html, final_url, status_code = fetch_product_page(url)
     asin = extract_asin(final_url) or extract_asin(url)
+    page_title = _extract_document_title(html)
 
     title = price = rating = review_count = category = ""
+    title_source = price_source = rating_source = review_source = "json_ld"
 
     for product in _parse_json_ld_products(html):
         t, p, r, rc, c = _extract_from_json_ld(product)
@@ -308,47 +671,53 @@ def extract_product_data(url):
         review_count = review_count or rc
         category = category or c
 
-    title = title or _first_match(
-        [
-            r'id=["\']productTitle["\'][^>]*>(.*?)</span>',
-            r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)',
-            r'"title"\s*:\s*"([^"]+)"',
-        ],
-        html,
-    )
+    if not title:
+        jt, jp, jr, jrc = _extract_from_asin_json(html, asin)
+        title = title or jt
+        price = price or jp
+        rating = rating or jr
+        review_count = review_count or jrc
+        if jt:
+            title_source = "asin_json"
 
-    price = price or _first_match(
-        [
-            r'class=["\']a-price-whole["\'][^>]*>([^<]+)',
-            r'"priceAmount"\s*:\s*([0-9.,]+)',
-            r'"price"\s*:\s*"([^"]+)"',
-            r'class=["\']a-offscreen["\'][^>]*>\s*([^<]+)\s*</span>',
-        ],
-        html,
-    )
+    if not title:
+        title, title_source = _first_match_named(TITLE_SELECTORS, html, sanitize_title=True)
 
-    rating = rating or _first_match(
-        [
-            r'class=["\']a-icon-alt["\'][^>]*>\s*([0-9.,]+)\s*(?:out of|من)',
-            r'"ratingValue"\s*:\s*"([^"]+)"',
-            r'data-hook=["\']rating-out-of-text["\'][^>]*>\s*([0-9.,]+)',
-        ],
-        html,
-    )
+    if not rating:
+        star_alt, star_source = _first_match_named((RATING_SELECTORS[7],), html)
+        if star_alt:
+            rating_match = re.search(r"([0-9]+(?:[.,][0-9]+)?)", star_alt)
+            if rating_match:
+                rating = rating_match.group(1)
+                rating_source = star_source
 
-    review_count = review_count or _first_match(
-        [
-            r'id=["\']acrCustomerReviewText["\'][^>]*>\s*([^<]+)',
-            r'"reviewCount"\s*:\s*"([^"]+)"',
-            r'class=["\']a-size-base["\'][^>]*>\s*([0-9,.\s]+)\s*(?:ratings|تقييم)',
-        ],
-        html,
-    )
+    if not price:
+        price, price_source = _first_match_named(PRICE_SELECTORS, html)
+        if not price:
+            whole, _ = _first_match_named((PRICE_SELECTORS[0],), html)
+            fraction, _ = _first_match_named((PRICE_SELECTORS[1],), html)
+            combined = _combine_price(whole, fraction)
+            if combined:
+                price = combined
+                price_source = "price_whole+fraction"
+
+    if not rating:
+        rating, rating_source = _first_match_named(RATING_SELECTORS, html)
+        if not rating:
+            popover, _ = _first_match_named((RATING_SELECTORS[3],), html)
+            rating_match = re.search(r"([0-9]+(?:[.,][0-9]+)?)", popover or "")
+            if rating_match:
+                rating = rating_match.group(1)
+                rating_source = "acr_popover"
+
+    if not review_count:
+        review_count, review_source = _first_match_named(REVIEW_COUNT_SELECTORS, html)
 
     category = category or _first_match(
         [
             r'id=["\']wayfinding-breadcrumbs_feature_div["\'][^>]*>(.*?)</div>',
             r'class=["\']a-breadcrumb["\'][^>]*>(.*?)</ul>',
+            r'"browseNodeInfo"[^}]*"contextFreeName"\s*:\s*"([^"]+)"',
         ],
         html,
     )
@@ -359,7 +728,68 @@ def extract_product_data(url):
         category = " > ".join(cleaned[:5]) if cleaned else _clean_text(category)
 
     if not title:
-        raise ProductExtractionError(EXTRACTION_FAIL_MESSAGE)
+        missing_fields = []
+        if not price:
+            missing_fields.append("السعر")
+        if not rating:
+            missing_fields.append("التقييم")
+        if not review_count:
+            missing_fields.append("عدد المراجعات")
+
+        captcha = _is_captcha_page(html, page_title)
+        title_diag = _selector_diagnostics(TITLE_SELECTORS, html)
+        price_diag = _selector_diagnostics(PRICE_SELECTORS, html)
+        rating_diag = _selector_diagnostics(RATING_SELECTORS, html)
+        review_diag = _selector_diagnostics(REVIEW_COUNT_SELECTORS, html)
+
+        logger.error(
+            "Amazon extraction failed | url=%s | status=%s | final_url=%s | asin=%s | "
+            "page_title=%s | html_len=%s | missing=%s | captcha=%s | "
+            "title_selectors=%s | price_selectors=%s | rating_selectors=%s | review_selectors=%s",
+            url,
+            status_code,
+            final_url,
+            asin or "غير معروف",
+            page_title or "غير متوفر",
+            len(html),
+            ",".join(missing_fields) or "العنوان",
+            captcha,
+            title_diag,
+            price_diag,
+            rating_diag,
+            review_diag,
+        )
+        _log_html_preview(html, final_url, status_code)
+
+        missing_text = "، ".join(missing_fields) if missing_fields else "العنوان"
+        if captcha:
+            raise ProductExtractionError(
+                f"أمازون طلب تحقق CAPTCHA (حجب آلي على VPS). HTTP {status_code}. "
+                f"الرابط النهائي: {final_url}. عنوان الصفحة: {page_title or 'Robot Check'}. "
+                f"ASIN: {asin or 'غير معروف'}"
+            )
+
+        raise ProductExtractionError(
+            f"تعذر استخراج عنوان المنتج (ASIN: {asin or 'غير معروف'}). "
+            f"HTTP {status_code}. الرابط النهائي: {final_url}. "
+            f"عنوان الصفحة: {page_title or 'غير متوفر'}. "
+            f"الحقول الناقصة: {missing_text}. "
+            f"محددات العنوان: {title_diag}"
+        )
+
+    logger.info(
+        "Amazon extraction success | asin=%s | title_source=%s | price_source=%s | "
+        "rating_source=%s | review_source=%s | title=%s",
+        asin or "غير معروف",
+        title_source,
+        price_source if price else "none",
+        rating_source if rating else "none",
+        review_source if review_count else "none",
+        title[:80],
+    )
+
+    if price:
+        price = price.strip().rstrip(",")
 
     return {
         "url": final_url,

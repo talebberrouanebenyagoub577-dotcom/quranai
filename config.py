@@ -43,6 +43,7 @@ class Config:
 
     BEHIND_PROXY = _env_bool("SAHRA_BEHIND_PROXY", False)
     GUNICORN_WORKERS = int(os.getenv("SAHRA_GUNICORN_WORKERS", "2"))
+    GUNICORN_TIMEOUT = int(os.getenv("SAHRA_GUNICORN_TIMEOUT", "120"))
 
 
 config = Config()

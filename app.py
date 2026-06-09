@@ -16,6 +16,11 @@ initialize_runtime()
 
 from brain import NeuralBrain
 from conversations import ConversationNotFoundError, ConversationStore
+from memory_inspector import (
+    detect_memory_inspection_command,
+    get_admin_memory_snapshot,
+    handle_memory_inspection_command,
+)
 from product_analyzer import (
     EXTRACTION_FAIL_MESSAGE,
     INSUFFICIENT_LAWS_MESSAGE,
@@ -589,7 +594,19 @@ def handle_product_memory_command(question):
     return PRODUCT_MEMORY.handle_command(command)
 
 
+def handle_brain_memory_command(question):
+    command = detect_memory_inspection_command(question)
+    if not command:
+        return None
+    logger.info("Memory inspection command: %s", command)
+    return handle_memory_inspection_command(command)
+
+
 def process_question(question, force_product_url=None):
+    brain_memory_report = handle_brain_memory_command(question)
+    if brain_memory_report:
+        return brain_memory_report
+
     memory_report = handle_product_memory_command(question)
     if memory_report:
         return memory_report
@@ -704,6 +721,11 @@ def analyze_amazon_product(url):
         sufficient=True,
         cached=False,
     )
+
+
+@app.route("/admin/memory", methods=["GET"])
+def admin_memory():
+    return jsonify(get_admin_memory_snapshot())
 
 
 @app.route("/health", methods=["GET"])
